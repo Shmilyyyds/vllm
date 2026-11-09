@@ -448,7 +448,12 @@ def _warmup_kernels(
                 req_computed[i] += decode_query_len if use_spec else 1
 
         all_indices = list(range(num_reqs))
-        use_spec_decode = num_spec_steps > 0
+        # TreeSpark requires an actual topology for each scheduled draft.
+        # Synthetic warmup placeholders only describe linear drafts.
+        spec_config = model_runner.speculative_config
+        use_spec_decode = num_spec_steps > 0 and (
+            spec_config is None or spec_config.treespark is None
+        )
 
         # Decode steps to warm, as (request indices, per-request spec flag).
         # Under spec decoding the scheduler drops requests the drafter proposed

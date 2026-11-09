@@ -100,6 +100,7 @@ class PenaltiesState(LogitsProcessor):
             self.presence_penalty.gpu,
             self.prompt_bin_mask,
             self.output_bin_counts,
+            ctx.draft_path_rows,
         )
         return logits
 
@@ -118,6 +119,8 @@ def _penalties_kernel(
     prompt_bin_mask_stride,
     output_bin_counts_ptr,
     output_bin_counts_stride,
+    draft_path_rows_ptr,
+    draft_path_stride,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -155,7 +158,12 @@ def _penalties_kernel(
     start_idx = token_idx - pos
     output_bin_counts = base_output_counts
     for prev_pos in tl.range(pos):
-        prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
+        prev_row = start_idx + prev_pos + 1
+        if draft_path_rows_ptr is not None:
+            prev_row = tl.load(
+                draft_path_rows_ptr + token_idx * draft_path_stride + prev_pos
+            )
+        prev_token = tl.load(token_ids_ptr + prev_row)
         token_match = block == prev_token
         output_bin_counts = output_bin_counts + token_match.to(tl.int32)
     output_bin_mask = output_bin_counts > 0
@@ -195,6 +203,7 @@ def apply_penalties(
     presence_penalty: torch.Tensor,
     prompt_bin_mask: torch.Tensor,
     output_bin_counts: torch.Tensor,
+    draft_path_rows: torch.Tensor | None = None,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = PENALTIES_BLOCK_SIZE
@@ -212,6 +221,8 @@ def apply_penalties(
         prompt_bin_mask.stride(0),
         output_bin_counts,
         output_bin_counts.stride(0),
+        draft_path_rows,
+        draft_path_rows.stride(0) if draft_path_rows is not None else 0,
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )

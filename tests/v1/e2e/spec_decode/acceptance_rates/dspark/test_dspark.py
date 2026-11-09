@@ -6,10 +6,16 @@ from dataclasses import dataclass
 import pytest
 
 from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
+from tests.models.utils import check_logprobs_close
+from vllm import SamplingParams
 from vllm.config import CompilationConfig
 from vllm.platforms import current_platform
 
-from ...utils import compute_acceptance_len, compute_acceptance_rate
+from ...utils import (
+    compute_acceptance_len,
+    compute_acceptance_rate,
+    get_spec_decode_metric_value,
+)
 
 REGRESSION_TOLERANCE = 0.95
 
@@ -33,6 +39,64 @@ class DSparkCorrectnessConfig:
     enforce_eager: bool = False
     disable_flashinfer_sampler: bool = False
     language_model_only: bool = False
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA FlexAttention")
+def test_treespark_matches_target_for_point_mass_sampling(vllm_runner):
+    prompts = [
+        "The first five positive even numbers are",
+        "The capital city of France is",
+    ]
+    options = dict(
+        enforce_eager=True,
+        async_scheduling=False,
+        attention_config={"backend": "FLEX_ATTENTION"},
+        max_model_len=512,
+        max_num_seqs=2,
+        max_num_batched_tokens=128,
+        disable_log_stats=False,
+    )
+    with vllm_runner("Qwen/Qwen3-4B", **options) as baseline:
+        expected = baseline.generate_greedy_logprobs(prompts, 24, 5)
+    with vllm_runner(
+        "Qwen/Qwen3-4B",
+        speculative_config={
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
+            "treespark": {"max_nodes": 16, "max_children": 3, "theta": 0.0},
+        },
+        **options,
+    ) as model:
+        actual = model.generate_greedy_logprobs(prompts, 24, 5)
+        metrics = model.get_llm().get_metrics()
+        rounds = get_spec_decode_metric_value(metrics, "vllm:spec_decode_num_drafts")
+        nodes = get_spec_decode_metric_value(
+            metrics, "vllm:spec_decode_num_draft_tokens"
+        )
+        assert rounds > 0 and nodes > 7 * rounds
+        # At nonzero temperature, top-k=1 still makes the target a point
+        # mass. The stochastic tree verifier must preserve that distribution.
+        stochastic = model.generate_w_logprobs(
+            prompts,
+            SamplingParams(
+                temperature=0.8, top_k=1, max_tokens=24, logprobs=5, seed=17
+            ),
+        )
+
+    check_logprobs_close(
+        outputs_0_lst=expected,
+        outputs_1_lst=actual,
+        name_0="target-only",
+        name_1="TreeSpark",
+        always_check_logprobs=True,
+    )
+    check_logprobs_close(
+        outputs_0_lst=expected,
+        outputs_1_lst=stochastic,
+        name_0="target-only",
+        name_1="TreeSpark stochastic",
+    )
 
 
 # References from 12 full GSM8K runs at temperature 1.0: accuracy 0.782-0.814,

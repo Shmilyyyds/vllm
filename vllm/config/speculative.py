@@ -432,6 +432,46 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
 
 
 @config
+class TreeSparkConfig:
+    """TreeSpark proposal policy for DSpark."""
+
+    max_nodes: int = Field(default=32, ge=1, le=256)
+    """Maximum number of nodes verified per request, excluding the anchor."""
+    max_children: int = Field(default=8, ge=1)
+    """Maximum number of children proposed per parent."""
+    theta: float = Field(default=0.02, ge=0.0, le=1.0)
+    """Minimum calibrated path survival, or its bound for stochastic draws."""
+    calibration_a: float = Field(default=0.6684, gt=0.0, allow_inf_nan=False)
+    """Slope of the calibration map in logit space."""
+    calibration_b: float = Field(default=-0.4587, allow_inf_nan=False)
+    """Intercept of the calibration map in logit space."""
+    theta_ladder: list[tuple[int, float, float]] = Field(default_factory=list)
+    """First matching (max batch size, max temperature, theta) entry wins."""
+    chain_min_batch_size: int | None = Field(default=None, ge=1)
+    """At or above this load, generate a chain within the depth and node caps."""
+
+    def __post_init__(self) -> None:
+        for batch_size, temperature, theta in self.theta_ladder:
+            if (
+                batch_size < 1
+                or not 0 <= temperature < float("inf")
+                or not 0 <= theta <= 1
+            ):
+                raise ValueError("Invalid TreeSpark theta ladder entry")
+
+    def policy(self, batch_size: int, temperature: float) -> tuple[int, float]:
+        if (
+            self.chain_min_batch_size is not None
+            and batch_size >= self.chain_min_batch_size
+        ):
+            return 1, 0.0
+        for max_batch, max_temp, theta in self.theta_ladder:
+            if batch_size <= max_batch and temperature <= max_temp:
+                return self.max_children, theta
+        return self.max_children, self.theta
+
+
+@config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -614,6 +654,9 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    treespark: TreeSparkConfig | None = None
+    """Enable calibrated tree proposals and tree verification with DSpark."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -710,6 +753,8 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
+        if self.treespark is not None:
+            factors.append(("treespark", self.treespark.max_nodes))
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())

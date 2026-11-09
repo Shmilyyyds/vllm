@@ -51,6 +51,12 @@ def init_speculator(
 
         return DFlashSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
+        if speculative_config.treespark is not None:
+            from vllm.v1.worker.gpu.spec_decode.dspark.treespark import (
+                TreeSparkSpeculator,
+            )
+
+            return TreeSparkSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )

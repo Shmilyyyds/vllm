@@ -405,6 +405,8 @@ class FlexAttentionMetadata:
     # generated tokens. Both must be set to enable.
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    tree_visibility: torch.Tensor | None = None
+    tree_anchor_offsets: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -462,6 +464,37 @@ class FlexAttentionMetadata:
         layout of the query and key/value tensors.
         """
         assert self.doc_ids is not None
+        if self.tree_visibility is not None:
+            visibility = self.tree_visibility
+            anchor_offsets = self.tree_anchor_offsets
+            assert anchor_offsets is not None
+
+            def tree_mask_mod(
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                physical_kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                valid, logical_q, logical_kv = self._convert_physical_to_logical(
+                    self.doc_ids, q_idx, physical_kv_idx
+                )
+                req = self.doc_ids[q_idx]
+                offset = anchor_offsets[req]
+                anchor = self.decode_offset[req] + offset
+                q = logical_q - anchor
+                k = logical_kv - anchor
+                width = visibility.shape[1]
+                tree_visible = (k < 0) | (
+                    (k < width)
+                    & visibility[req, q.clamp(0, width - 1), k.clamp(0, width - 1)]
+                )
+                return valid & torch.where(
+                    (offset >= 0) & (q >= 0) & (q < width),
+                    tree_visible,
+                    logical_kv <= logical_q,
+                )
+
+            return tree_mask_mod
 
         def final_mask_mod(
             b: torch.Tensor,

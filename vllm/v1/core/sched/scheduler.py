@@ -1310,6 +1310,7 @@ class Scheduler(SchedulerInterface):
                     # Not for diffusion where draft tokens can't be padded.
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        and (spec is None or spec.treespark is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
@@ -2875,6 +2876,19 @@ class Scheduler(SchedulerInterface):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
+
+            spec = self.vllm_config.speculative_config
+            if spec is not None and spec.treespark is not None:
+                params = request.sampling_params
+                # The ordinary sampler handles path-dependent processors
+                # until they can consume ancestor history in the tree.
+                if (
+                    request.use_structured_output
+                    or params is None
+                    or params.thinking_token_budget is not None
+                ):
+                    request.spec_token_ids = []
+                    continue
 
             # Add newly generated spec token ids to the request.
             request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(

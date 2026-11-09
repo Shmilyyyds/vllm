@@ -87,6 +87,8 @@ class LogitsContext:
     # being sampled this step, on the host. Exact when spec decoding isn't in use.
     # Exact per-row lengths on device are `pos + 1`.
     seq_lens_upper_bound_np: np.ndarray
+    # Optional [logit row, draft depth] indices into input_ids for a tree path.
+    draft_path_rows: torch.Tensor | None = None
 
 
 class LogitsProcessor(ABC):

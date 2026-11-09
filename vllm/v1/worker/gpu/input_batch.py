@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
         AdmittedDraftCounts,
     )
+    from vllm.v1.worker.gpu.spec_decode.dspark.treespark import TreeSparkBatch
 
 
 class InputBuffers:
@@ -130,6 +131,7 @@ class InputBatch:
     # [num_reqs] admitted draft counts in flight to the host. Set only under
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
+    treespark: "TreeSparkBatch | None" = None
 
     @classmethod
     def make_dummy(

@@ -163,6 +163,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.dspark.treespark import TreeSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     requires_aux_hidden_states,
     set_eagle3_aux_hidden_state_layers,
@@ -718,6 +719,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
             )
+        if isinstance(self.speculator, TreeSparkSpeculator) and any(
+            group.backend.get_name() != "FLEX_ATTENTION"
+            or isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for groups in self.attn_groups
+            for group in groups
+        ):
+            raise ValueError(
+                "TreeSpark requires full attention with "
+                "--attention-backend FLEX_ATTENTION."
+            )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
@@ -1229,6 +1240,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
         for req_id in sorted(finished_req_ids):
+            if isinstance(self.speculator, TreeSparkSpeculator):
+                self.speculator.trees.pop(req_id, None)
             self._remove_request(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -1624,6 +1637,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
+        if isinstance(self.speculator, TreeSparkSpeculator):
+            input_batch.treespark = self.speculator.prepare_tree_batch(
+                input_batch, draft_tokens
+            )
         return input_batch
 
     def prepare_attn(
@@ -1708,7 +1725,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         sampler_output: SamplerOutput | None
-        if input_batch.num_reqs == 0:
+        if input_batch.treespark is not None:
+            assert isinstance(self.speculator, TreeSparkSpeculator)
+            assert self.sampler is not None
+            sampler_output = input_batch.treespark.verify(
+                logits, input_batch, self.sampler, self.speculator.num_speculative_steps
+            )
+        elif input_batch.num_reqs == 0:
             # This rank owns no requests this step. It contributes an
             # all-padding block to the gather below.
             sampler_output = None
@@ -2008,6 +2031,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if input_batch.treespark is not None:
+                from vllm.v1.attention.backends.flex_attention import (
+                    FlexAttentionMetadata,
+                )
+
+                tree = input_batch.treespark
+                for metadata in attn_metadata.values():
+                    if not isinstance(metadata, FlexAttentionMetadata):
+                        raise RuntimeError("TreeSpark requires FlexAttention metadata")
+                    metadata.tree_visibility = tree.visibility
+                    metadata.tree_anchor_offsets = tree.anchor_offsets
+                    metadata.mask_mod = metadata.get_mask_mod()
+                    metadata.block_mask = None
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2049,6 +2085,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if input_batch.treespark is not None:
+            model_inputs["positions"] = input_batch.treespark.positions
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             if not requires_raw_input_tokens(self.model):
@@ -2308,6 +2346,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch, draft_lookahead=1
             )
 
+        if input_batch.treespark is not None:
+            assert attn_metadata is not None and slot_mappings_by_layer is not None
+            layers = self.compilation_config.static_forward_context
+            input_batch.treespark.commit(
+                draft_hidden_states,
+                aux_hidden_states,
+                {name: layers[name].kv_cache for name in attn_metadata},
+                slot_mappings_by_layer,
+            )
+
         # Postprocess results and update request states.
         # NOTE: This is intentionally done after creating the AsyncOutput,
         # ensuring that `copy_event` is recorded before calling postprocess.
@@ -2351,7 +2399,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
                 )
-            if num_spec_tokens < self.num_speculative_steps:
+            if isinstance(self.speculator, TreeSparkSpeculator):
+                draft_tokens = self.speculator.publish(
+                    input_batch, self.sampler, num_sampled
+                )
+            elif num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
@@ -2359,7 +2411,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not isinstance(
+            self.speculator, TreeSparkSpeculator
+        ):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
@@ -2378,6 +2432,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if isinstance(self.speculator, TreeSparkSpeculator):
+            drafts, self.speculator.latest_drafts = self.speculator.latest_drafts, None
+            return drafts
         return self.draft_tokens_handler.get_draft_tokens()
 
     @torch.inference_mode()

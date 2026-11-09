@@ -629,6 +629,8 @@ class VllmConfig:
             self.speculative_config is not None
             and self.speculative_config.num_speculative_tokens is not None
         ):
+            if self.speculative_config.treespark is not None:
+                return self.speculative_config.treespark.max_nodes
             return self.speculative_config.num_speculative_tokens
         if (
             self.diffusion_config is not None
@@ -651,6 +653,17 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
+        if speculative_config.treespark is not None:
+            # Tree nodes occupy target verification slots; the DSpark backbone
+            # still needs only its own parallel query block after the prefix.
+            sample_from_anchor = getattr(
+                speculative_config.draft_model_config.hf_config,
+                "sample_from_anchor",
+                True,
+            )
+            return speculative_config.num_speculative_tokens + int(
+                not sample_from_anchor
+            )
         dspark_fill_in = speculative_config.use_dspark() and not getattr(
             speculative_config.draft_model_config.hf_config, "sample_from_anchor", True
         )
@@ -1663,6 +1676,10 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
+
+        if self.speculative_config and self.speculative_config.treespark is not None:
+            self._validate_treespark()
+            self.scheduler_config.async_scheduling = False
 
         # Async scheduling incompatibilities specific to the V1 model runner.
         v1_async_sched_incompat: str | None = None
@@ -3167,6 +3184,56 @@ class VllmConfig:
             unsupported.append("Step5")
 
         return unsupported
+
+    def _validate_treespark(self) -> None:
+        spec = self.speculative_config
+        model = self.model_config
+        parallel = self.parallel_config
+        assert spec is not None and spec.treespark is not None
+        if not spec.use_dspark():
+            raise ValueError("TreeSpark requires method='dspark'.")
+        if not current_platform.is_cuda():
+            raise ValueError("TreeSpark requires a CUDA device.")
+        if model is None or model.hf_config.model_type != "qwen3":
+            raise ValueError("TreeSpark currently requires a Qwen3 target.")
+        if not model.enforce_eager or not self.use_v2_model_runner:
+            raise ValueError("TreeSpark requires --enforce-eager and Model Runner V2.")
+        if self.scheduler_config.async_scheduling:
+            raise ValueError("TreeSpark requires synchronous scheduling.")
+        if (
+            parallel.pipeline_parallel_size != 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.use_ubatching
+        ):
+            raise ValueError("TreeSpark currently requires a single device.")
+        if (
+            spec.enable_adaptive_verification
+            or spec.uses_dynamic_speculative_decoding()
+            or spec.dspark_draft_topk is not None
+            or getattr(spec.draft_model_config.hf_config, "dspark_draft_topk", None)
+            or spec.rejection_sample_method != "standard"
+        ):
+            raise ValueError(
+                "TreeSpark uses its own proposal, budget and verification policy."
+            )
+        if (
+            self.kv_transfer_config is not None
+            or self.cache_config.kv_sharing_fast_prefill
+            or self.lora_config is not None
+            or self.watermark_config is not None
+            or self.aux_output_config.enabled
+            or model.logits_processors
+            or model.enable_trace_replay
+            or model.return_sampling_mask
+        ):
+            raise ValueError(
+                "TreeSpark does not yet support KV transfer, fast prefill, LoRA, "
+                "watermarking, auxiliary outputs, custom logits processors, "
+                "trace replay, or returning the sampling mask."
+            )
 
     def _validate_adaptive_verification(self) -> None:
         spec_config = self.speculative_config

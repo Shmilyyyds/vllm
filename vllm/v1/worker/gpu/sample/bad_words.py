@@ -94,6 +94,7 @@ class BadWordsState(LogitsProcessor):
             ctx.input_ids,
             ctx.expanded_local_pos,
             max_num_bad_words,
+            ctx.draft_path_rows,
         )
         return logits
 
@@ -114,6 +115,8 @@ def _bad_words_kernel(
     total_len_ptr,
     input_ids_ptr,
     expanded_local_pos_ptr,
+    draft_path_rows_ptr,
+    draft_path_stride,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     bw_idx = tl.program_id(1)
@@ -155,7 +158,12 @@ def _bad_words_kernel(
             # input_ids at local position 0 is the last committed token;
             # draft tokens start at local position 1.
             spec_offset = actual_pos - output_len
-            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
+            draft_row = cur_req_first_pos + spec_offset + 1
+            if draft_path_rows_ptr is not None:
+                draft_row = tl.load(
+                    draft_path_rows_ptr + token_idx * draft_path_stride + spec_offset
+                )
+            actual = tl.load(input_ids_ptr + draft_row)
         else:
             actual = tl.load(output_base + actual_pos)
 
@@ -177,6 +185,7 @@ def apply_bad_words(
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     max_num_bad_words: int,
+    draft_path_rows: torch.Tensor | None = None,
 ) -> None:
     num_tokens = logits.shape[0]
     _bad_words_kernel[(num_tokens, max_num_bad_words)](
@@ -194,4 +203,6 @@ def apply_bad_words(
         total_len,
         input_ids,
         expanded_local_pos,
+        draft_path_rows,
+        draft_path_rows.stride(0) if draft_path_rows is not None else 0,
     )
