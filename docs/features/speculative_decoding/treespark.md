@@ -107,3 +107,66 @@ stochastic tree verifier. Passing this case does not establish general
 stochastic distribution correctness. This script is not a performance
 benchmark; benchmark separately after correctness checks pass, with warmup
 and repeated measurements.
+
+## Performance against the original reproduction
+
+`benchmarks/benchmark_treespark.py` directly measures generation performance;
+it does not run or require the correctness script. It reads the six local
+JSONL files (`gsm8k`, `math500`, `humaneval`, `mbpp`, `mt-bench`, `alpaca`),
+selects indices 8 through 24 in each, and uses `turns[0]` with the target chat
+template and thinking disabled. Defaults match the original 102-prompt,
+temperature-zero, BF16, 150-new-token reproduction.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  .venv/bin/python -P -u benchmarks/benchmark_treespark.py \
+  --target /path/to/TreeSpark/checkpoints/Qwen3-4B \
+  --draft /path/to/TreeSpark/checkpoints/dspark_qwen3_4b_block7 \
+  --data-dir /path/to/TreeSpark/eval_datasets \
+  --legacy-run /path/to/TreeSpark/runs/speed_bf16_formal_20261023_170447 \
+  --output /path/to/new-performance-results
+```
+
+The command runs seven modes sequentially, with one model instance at a
+time. Each loads once, runs one untimed corpus pass, then measures three
+passes. `ar` and `dspark` use the same FlexAttention, eager, synchronous
+configuration required by the current tree implementation. `chain7` uses
+TreeSpark with seven nodes and one child; `adapt0.02` and `adapt0.05` use
+64 nodes, eight children, and the original calibration constants. This
+distinguishes the original single-branch control from native DSpark.
+`native_ar` and `native_dspark` retain vLLM's default attention, compilation
+and scheduling options, within Runner V2, as deployment baselines. All
+modes disable prefix caching and use the same weights and request limits.
+Use `--modes` to select modes, `--repeats` to change measured passes, or
+`--warmup` to change untimed corpus passes.
+
+The default batch size is one, sending requests sequentially as in the old
+reproduction. Timing includes template rendering, tokenization, generation
+and output collection, excluding model loading, warmup, file writes and
+metric snapshots. It uses actual output token counts with normal EOS
+stopping and a strict 150-token cap. The old generator could emit extra
+tokens in its final speculative round; its timing also lacked uniform
+warmup and used a different software environment. Ratios against historical
+results therefore measure the overall migration, including caching and
+runtime differences, rather than an isolated TreeSpark algorithm change.
+They are emitted only when the historical manifest matches the sample
+range and output budget, and batch size is one. Keep historical and new
+raw counts when reporting results.
+
+`summary.md` and `summary.json` report median throughput, median elapsed
+time, and throughput ratios against matched DSpark, default DSpark, the
+vLLM single-branch control, and the historical matching arm. Each mode's
+JSON includes all measured and warmup passes, input-token hashes, versions,
+engine options, actual output counts and speculation counters. Measured
+outputs are also saved. `accepted/round` excludes the bonus token and must
+not be equated to the original prompt-averaged tau. Model initialization
+failures are marked and excluded; the other modes continue and the final
+exit code is nonzero. Token disagreement does not gate this benchmark.
+
+For a separate queued-throughput run, set `--batch-size 16` and choose a
+new output directory. All 102 requests are submitted together with at most
+16 active; historical single-request ratios are then omitted. These rates
+must not be presented as the single-request migration comparison. The
+current tree path's host synchronization and eager execution remain part
+of the measured cost; this benchmark does not imply support for tree
+CUDA graphs or asynchronous scheduling.
