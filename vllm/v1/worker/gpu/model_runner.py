@@ -719,16 +719,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
             )
-        if isinstance(self.speculator, TreeSparkSpeculator) and any(
-            group.backend.get_name() != "FLEX_ATTENTION"
-            or isinstance(group.kv_cache_spec, SlidingWindowSpec)
-            for groups in self.attn_groups
-            for group in groups
-        ):
-            raise ValueError(
-                "TreeSpark requires full attention with "
-                "--attention-backend FLEX_ATTENTION."
-            )
+        if isinstance(self.speculator, TreeSparkSpeculator):
+            assert target_attn_layer_names is not None
+            unsupported = {
+                f"{group.backend.get_name()} ({type(group.kv_cache_spec).__name__})"
+                for groups in self.attn_groups
+                for group in groups
+                if not target_attn_layer_names.isdisjoint(group.layer_names)
+                and (
+                    group.backend.get_name() != "FLEX_ATTENTION"
+                    or isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                )
+            }
+            if unsupported:
+                raise ValueError(
+                    "TreeSpark requires full attention with "
+                    "--attention-backend FLEX_ATTENTION on the target model. "
+                    f"Unsupported target groups: {', '.join(sorted(unsupported))}"
+                )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
@@ -2036,8 +2044,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     FlexAttentionMetadata,
                 )
 
+                assert isinstance(self.speculator, TreeSparkSpeculator)
                 tree = input_batch.treespark
-                for metadata in attn_metadata.values():
+                for name, metadata in attn_metadata.items():
+                    if name in self.speculator.draft_attn_layer_names:
+                        continue
                     if not isinstance(metadata, FlexAttentionMetadata):
                         raise RuntimeError("TreeSpark requires FlexAttention metadata")
                     metadata.tree_visibility = tree.visibility
@@ -2347,12 +2358,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if input_batch.treespark is not None:
+            assert isinstance(self.speculator, TreeSparkSpeculator)
             assert attn_metadata is not None and slot_mappings_by_layer is not None
             layers = self.compilation_config.static_forward_context
             input_batch.treespark.commit(
                 draft_hidden_states,
                 aux_hidden_states,
-                {name: layers[name].kv_cache for name in attn_metadata},
+                {
+                    name: layers[name].kv_cache
+                    for name in attn_metadata
+                    if name not in self.speculator.draft_attn_layer_names
+                },
                 slot_mappings_by_layer,
             )
 
