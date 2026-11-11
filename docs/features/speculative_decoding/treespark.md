@@ -72,3 +72,38 @@ VLLM_USE_V2_MODEL_RUNNER=1 .venv/bin/python -m pytest -q \
 The end-to-end test loads the Qwen3 target and DSpark draft weights. It
 checks target-only greedy output and logprobs and verifies that the engine
 scheduled more nodes per round than the draft depth.
+
+For local checkpoints, a standalone comparison uses the installed runtime
+without the pytest dependencies:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  .venv/bin/python -P -u \
+  examples/features/speculative_decoding/treespark_validate.py \
+  --target /path/to/Qwen3-4B \
+  --draft /path/to/dspark_qwen3_4b_block7 \
+  --output-dir /path/to/new-validation-results
+```
+
+Run from the repository root using the Python interpreter in your vLLM
+environment. The output directory must be new. The script runs target-only,
+native DSpark and TreeSpark sequentially in separate processes, using local
+weights, Runner V2, BF16, eager execution, synchronous scheduling and
+FlexAttention. Each mode generates 64 tokens for four prompts with greedy
+sampling and then with temperature 0.8 and top-k 1. Prefix caching is disabled.
+
+The script requires exact token agreement and checks sampled-token raw
+logprobs with absolute tolerance 0.1 (configurable with `--logprob-atol`). It
+also checks that speculation accepts tokens and that TreeSpark verifies more
+nodes per round than the draft depth. JSON files preserve outputs, top
+logprobs, engine options and per-case metrics; `comparison.json` records the
+first token divergence per request and any logprob mismatches before it.
+Exit code zero means all of these checks passed. A mismatch needs investigation:
+BF16 numerical differences can change near-tied argmax decisions as well as
+implementation errors.
+
+Top-k 1 makes the target distribution deterministic while exercising the
+stochastic tree verifier. Passing this case does not establish general
+stochastic distribution correctness. This script is not a performance
+benchmark; benchmark separately after correctness checks pass, with warmup
+and repeated measurements.
